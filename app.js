@@ -1,171 +1,177 @@
-const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios");
-
 const TOKEN = "8649973945:AAHsaN1YZ1Vt_rtPTqjNKefLKvpAKHJEASI";
-const WEBAPP_URL = "https://akshin013.github.io/P2P-Helper/index/app.html";
+const API = `https://api.telegram.org/bot${TOKEN}`;
 
-const bot = new TelegramBot(TOKEN, { polling: true });
+const API_URL = "https://api2.bybit.com/fiat/otc/item/online";
 
-// ───── настройки ─────
 let running = false;
-let SEARCH_AMOUNT = "3000";
-let MAX_PRICE = 82;
-
-let USE_PRICE_FILTER = false;
-let USE_BLACKLIST = true;
-
-const BLACKLIST = ["тбанк", "тинькофф", "tinkoff"];
-
-let totalChecked = 0;
-let totalFound = 0;
-
-let lastStatusMsg = null;
 let seen = new Set();
 
-// ───── клавиатура ─────
-const keyboard = {
-  reply_markup: {
-    keyboard: [
-      [{ text: "📱 Открыть панель", web_app: { url: WEBAPP_URL } }],
-      ["▶️ Старт", "⛔ Стоп", "📊 Статус"]
-    ],
-    resize_keyboard: true
+let SETTINGS = {
+  amount: "2500",
+  mode: "exact",
+  maxPrice: 82,
+  blacklist: true,
+  priceFilter: false
+};
+
+const BLACKLIST = ["тбанк", "т банк", "тинькофф", "tinkoff"];
+
+export default {
+  async fetch(request, env, ctx) {
+
+    // 📩 TELEGRAM WEBHOOK
+    if (request.method === "POST") {
+      const update = await request.json();
+
+      if (update.message) {
+        const chatId = update.message.chat.id;
+
+        // 🔘 КНОПКИ
+        if (update.message.text === "/start") {
+          await sendMessage(chatId, "🚀 Бот готов", {
+            keyboard: [[{ text: "📱 Открыть панель", web_app: { url: "https://akshin013.github.io/P2P-Helper/index/app.html" } }]],
+            resize_keyboard: true
+          });
+        }
+
+        // 📲 ДАННЫЕ ИЗ WEBAPP
+        if (update.message.web_app_data) {
+          const data = JSON.parse(update.message.web_app_data.data);
+
+          SETTINGS = { ...SETTINGS, ...data };
+
+          if (data.running && !running) {
+            running = true;
+            ctx.waitUntil(scanner(chatId));
+          }
+
+          if (!data.running) {
+            running = false;
+          }
+        }
+      }
+
+      return new Response("ok");
+    }
+
+    return new Response("Bot running 🚀");
   }
 };
 
-// ───── старт ─────
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "🚀 Запусти сканер", keyboard);
-});
+// ───── СКАНЕР ─────
+async function scanner(chatId) {
+  while (running) {
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tokenId: "USDT",
+          currencyId: "RUB",
+          side: "1",
+          size: "50",
+          page: "1"
+        })
+      });
 
-// ───── сообщения ─────
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
+      const data = await res.json();
+      const ads = data?.result?.items || [];
 
-  // 📱 WebApp данные
-  if (msg.web_app_data) {
-    const data = JSON.parse(msg.web_app_data.data);
+      for (const ad of ads) {
+        if (!isValid(ad)) continue;
 
-    SEARCH_AMOUNT = data.amount || SEARCH_AMOUNT;
-    USE_BLACKLIST = data.blacklist;
-    USE_PRICE_FILTER = data.priceFilter;
-    MAX_PRICE = Number(data.maxPrice || MAX_PRICE);
+        const id = ad.id;
+        if (seen.has(id)) continue;
+        seen.add(id);
 
-    if (data.running && !running) startScanner(chatId);
-    if (!data.running && running) stopScanner(chatId);
+        const msg = formatOrder(ad);
 
-    return;
+        await sendMessage(chatId, msg);
+
+        // 📤 отправка в WebApp
+        await sendWebAppEvent(chatId, ad);
+      }
+
+    } catch (e) {
+      console.log("error:", e);
+    }
+
+    await sleep(2000);
   }
+}
 
-  if (msg.text === "▶️ Старт") {
-    if (!running) startScanner(chatId);
-  }
-
-  if (msg.text === "⛔ Стоп") {
-    stopScanner(chatId);
-  }
-
-  if (msg.text === "📊 Статус") {
-    bot.sendMessage(chatId,
-      `📊 СТАТУС\n🤖 ${running ? "Работает" : "Стоп"}\n🔍 ${SEARCH_AMOUNT}\n📦 ${totalChecked}\n🔥 ${totalFound}`
-    );
-  }
-});
-
-// ───── фильтр ─────
+// ───── ПРОВЕРКИ ─────
 function isValid(ad) {
   const text = (ad.remark || "").toLowerCase();
 
-  if (!text.includes(SEARCH_AMOUNT)) return false;
+  if (SETTINGS.mode === "exact" && !text.includes(SETTINGS.amount)) {
+    return false;
+  }
 
-  if (USE_BLACKLIST && BLACKLIST.some(b => text.includes(b))) return false;
+  if (SETTINGS.blacklist && BLACKLIST.some(b => text.includes(b))) {
+    return false;
+  }
 
-  if (USE_PRICE_FILTER && Number(ad.price) > MAX_PRICE) return false;
+  if (SETTINGS.priceFilter && Number(ad.price) > SETTINGS.maxPrice) {
+    return false;
+  }
 
   return true;
 }
 
-// ───── управление ─────
-function startScanner(chatId) {
-  running = true;
-  totalChecked = 0;
-  totalFound = 0;
-  seen.clear();
-
-  bot.sendMessage(chatId, `✅ Запуск\n🔍 ${SEARCH_AMOUNT}`, keyboard);
-  scanner(chatId);
+// ───── ФОРМАТ ─────
+function formatOrder(ad) {
+  return `🔥 НАЙДЕН ОРДЕР
+👤 ${ad.nickName}
+💰 ${ad.price} RUB
+📝 ${ad.remark || "-"}
+🔗 https://www.bybit.com/fiat/trade/otc?tab=buy&id=${ad.id}`;
 }
 
-function stopScanner(chatId) {
-  running = false;
-  bot.sendMessage(chatId, "⛔ Остановлен", keyboard);
+// ───── TELEGRAM ─────
+async function sendMessage(chatId, text, reply_markup = null) {
+  await fetch(`${API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup
+    })
+  });
 }
 
-// ───── сканер ─────
-async function scanner(chatId) {
-  while (running) {
-    try {
-      const res = await axios.post("https://api2.bybit.com/fiat/otc/item/online", {
-        tokenId: "USDT",
-        currencyId: "RUB",
-        side: "1",
-        size: "50",
-        page: "1"
-      });
-
-      const ads = res.data?.result?.items || [];
-      totalChecked += ads.length;
-
-      for (const ad of ads) {
-        if (!isValid(ad)) continue;
-        if (seen.has(ad.id)) continue;
-
-        seen.add(ad.id);
-        totalFound++;
-
-        const link = `https://www.bybit.com/fiat/trade/otc?tab=buy&id=${ad.id}`;
-
-        const order = {
-          id: ad.id,
-          nick: ad.nickName,
-          price: ad.price,
-          min: ad.minAmount,
-          max: ad.maxAmount,
-          remark: ad.remark,
-          link,
-          time: new Date().toLocaleTimeString()
-        };
-
-        const encoded = encodeURIComponent(JSON.stringify(order));
-
-        await bot.sendMessage(chatId,
-          `🔥 ОРДЕР\n👤 ${order.nick}\n💰 ${order.price}\n📝 ${order.remark}`,
-          {
-            reply_markup: {
-              inline_keyboard: [[
-                { text: "🔗 Открыть", url: link },
-                { text: "📱 Панель", web_app: { url: WEBAPP_URL + "?order=" + encoded } }
-              ]]
-            }
-          }
-        );
-      }
-
-      // 🧹 удаляем старый статус
-      if (lastStatusMsg) {
-        try { await bot.deleteMessage(chatId, lastStatusMsg); } catch {}
-      }
-
-      const msg = await bot.sendMessage(chatId,
-        `⏳ Сканирую...\n📦 ${totalChecked}\n🔥 ${totalFound}`
-      );
-
-      lastStatusMsg = msg.message_id;
-
-    } catch (e) {
-      console.log("ERROR:", e.message);
+// ───── WEBAPP PUSH ─────
+async function sendWebAppEvent(chatId, ad) {
+  const payload = {
+    type: "new_order",
+    order: {
+      nick: ad.nickName,
+      price: ad.price,
+      min: ad.minAmount,
+      max: ad.maxAmount,
+      remark: ad.remark,
+      link: `https://www.bybit.com/fiat/trade/otc?tab=buy&id=${ad.id}`,
+      time: new Date().toLocaleTimeString()
     }
+  };
 
-    await new Promise(r => setTimeout(r, 2000));
-  }
+  await fetch(`${API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: "📦",
+      reply_markup: {
+        inline_keyboard: [[{
+          text: "Открыть",
+          web_app: { url: `https://akshin013.github.io/P2P-Helper/index/app.html?order=${encodeURIComponent(JSON.stringify(payload.order))}` }
+        }]]
+      }
+    })
+  });
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
