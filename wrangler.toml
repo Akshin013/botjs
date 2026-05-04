@@ -1,4 +1,4 @@
-name = "p2p-scanner-bot"
+name = "botjs"
 main = "worker.js"
 compatibility_date = "2024-05-01"
 
